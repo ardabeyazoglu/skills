@@ -126,6 +126,34 @@ description: ${description}
       expect(result.stdout).not.toMatch(/\x1b\[/);
     });
 
+    it('should report project skill provenance from skills-lock.json', () => {
+      createTestSkill(testDir, 'project-skill', 'A tracked project skill');
+      writeFileSync(
+        join(testDir, 'skills-lock.json'),
+        JSON.stringify({
+          version: 1,
+          skills: {
+            'project-skill': {
+              source: 'owner/project-skills',
+              sourceUrl: 'https://github.com/owner/project-skills',
+              sourceType: 'github',
+              computedHash: 'project-hash',
+            },
+          },
+        })
+      );
+
+      const result = runCli(['list', '--json'], testDir);
+      const [skill] = JSON.parse(result.stdout.trim());
+
+      expect(skill).toMatchObject({
+        source: 'owner/project-skills',
+        sourceUrl: 'https://github.com/owner/project-skills',
+        sourceType: 'github',
+      });
+      expect(skill).not.toHaveProperty('origin');
+    });
+
     it('should output multiple skills as JSON array', () => {
       createTestSkill(testDir, 'skill-alpha', 'Alpha');
       createTestSkill(testDir, 'skill-beta', 'Beta');
@@ -157,6 +185,89 @@ description: ${description}
       expect(result.exitCode).toBe(0);
     });
 
+    it('should show a tracked project skill source in human output', () => {
+      createTestSkill(testDir, 'tracked-skill', 'A tracked project skill');
+      writeFileSync(
+        join(testDir, 'skills-lock.json'),
+        JSON.stringify({
+          version: 1,
+          skills: {
+            'tracked-skill': {
+              source: 'owner/project-skills',
+              sourceType: 'github',
+              computedHash: 'project-hash',
+            },
+          },
+        })
+      );
+
+      const result = runCli(['list'], testDir);
+
+      expect(result.stdout).toContain('Source:');
+      expect(result.stdout).toContain('owner/project-skills');
+      expect(result.stdout).not.toContain('Origin:');
+    });
+
+    describe('lock status', () => {
+      beforeEach(() => {
+        createTestSkill(testDir, 'tracked-skill', 'Installed and locked');
+        createTestSkill(testDir, 'handmade-skill', 'Installed, not locked');
+        const entry = { source: 'owner/repo', sourceType: 'github', computedHash: 'h' };
+        writeFileSync(
+          join(testDir, 'skills-lock.json'),
+          JSON.stringify({ version: 1, skills: { 'tracked-skill': entry, 'gone-skill': entry } })
+        );
+      });
+
+      it('reports each skill as tracked, untracked or missing in JSON', () => {
+        const skills: Array<{ name: string; status: string }> = JSON.parse(
+          runCli(['list', '--json'], testDir).stdout.trim()
+        );
+
+        expect(Object.fromEntries(skills.map((s) => [s.name, s.status]))).toEqual({
+          'tracked-skill': 'tracked',
+          'handmade-skill': 'untracked',
+          'gone-skill': 'missing',
+        });
+      });
+
+      it('labels untracked skills and lists missing ones', () => {
+        const { stdout } = runCli(['list'], testDir);
+
+        expect(stdout).toContain('Source: untracked');
+        expect(stdout).toContain('Missing');
+        expect(stdout).toContain('gone-skill');
+      });
+
+      it('does not report missing skills when filtering by agent', () => {
+        const { stdout } = runCli(['list', '-a', 'claude-code'], testDir);
+
+        expect(stdout).not.toContain('gone-skill');
+      });
+    });
+
+    it('should keep untrusted source metadata on one output line', () => {
+      createTestSkill(testDir, 'tracked-skill', 'A tracked project skill');
+      writeFileSync(
+        join(testDir, 'skills-lock.json'),
+        JSON.stringify({
+          version: 1,
+          skills: {
+            'tracked-skill': {
+              source: 'owner/\nFORGED',
+              sourceType: 'github',
+              computedHash: 'project-hash',
+            },
+          },
+        })
+      );
+
+      const result = runCli(['list'], testDir);
+
+      expect(result.stdout).toContain('Source: owner/ FORGED');
+      expect(result.stdout).not.toContain('\nFORGED');
+    });
+
     it('should list multiple skills', () => {
       createTestSkill(testDir, 'skill-one', 'First skill');
       createTestSkill(testDir, 'skill-two', 'Second skill');
@@ -179,6 +290,40 @@ description: ${description}
       expect(result.stdout).not.toContain('project-skill');
       expect(result.stdout).toContain('global-skill');
       expect(result.stdout).toContain('Global Skills');
+    });
+
+    it('should report global provenance when a lock key differs from its folder name', () => {
+      const testHome = join(testDir, 'home');
+      createTestSkill(testHome, 'ce-review', 'A tracked global plugin skill');
+      const lockDir = join(testHome, '.local', 'state', 'skills');
+      mkdirSync(lockDir, { recursive: true });
+      writeFileSync(
+        join(lockDir, '.skill-lock.json'),
+        JSON.stringify({
+          version: 3,
+          skills: {
+            'ce:review': {
+              source: 'everyinc/compound-engineering-plugin',
+              sourceUrl: 'https://github.com/everyinc/compound-engineering-plugin',
+              sourceType: 'github',
+              skillFolderHash: 'global-hash',
+              installedAt: '2026-07-01T00:00:00.000Z',
+              updatedAt: '2026-07-01T00:00:00.000Z',
+            },
+          },
+        })
+      );
+
+      const result = runCli(['list', '-g', '--json'], testDir, { HOME: testHome });
+      const skills = JSON.parse(result.stdout.trim());
+
+      expect(skills).toHaveLength(1);
+      expect(skills[0]).toMatchObject({
+        name: 'ce-review',
+        source: 'everyinc/compound-engineering-plugin',
+        sourceUrl: 'https://github.com/everyinc/compound-engineering-plugin',
+        sourceType: 'github',
+      });
     });
 
     it('should show error for invalid agent filter', () => {

@@ -1,32 +1,125 @@
-import { spawnSync } from 'child_process';
 import { existsSync, readdirSync } from 'fs';
 import { join, dirname, relative, sep } from 'path';
-import { fileURLToPath } from 'url';
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 
-import { readSkillLock, getGitHubToken, type SkillLockEntry } from './skill-lock.ts';
-import { computeSkillFolderHash, readLocalLock, type LocalSkillLockEntry } from './local-lock.ts';
+import {
+  readSkillLock,
+  getGitHubToken,
+  addSkillToLock,
+  type SkillLockEntry,
+} from './skill-lock.ts';
+import {
+  computeSkillFolderHash,
+  readLocalLock,
+  addSkillToLocalLock,
+  type LocalSkillLockEntry,
+} from './local-lock.ts';
 import {
   formatSourceInput,
   buildUpdateInstallSource,
   buildLocalUpdateSource,
+  buildLocalCloneSource,
+  shouldUseFullDepthForUpdate,
 } from './update-source.ts';
-import { cloneRepo, cleanupTempDir } from './git.ts';
+import { cloneRepo, cleanupTempDir, getGitTreeHash } from './git.ts';
 import { discoverSkills } from './skills.ts';
-import { fetchRepoTree, findSkillMdPaths, getSkillFolderHashFromTree } from './blob.ts';
+import { fetchRepoTree, getSkillFolderHashFromTree, type RepoTree } from './blob.ts';
+import { mapConcurrent } from './concurrency.ts';
+import { parseSource } from './source-parser.ts';
+import {
+  buildInstallTargets,
+  defaultInstallMode,
+  fetchSources,
+  installFetched,
+  installToTargets,
+  nonInteractiveTargetAgents,
+  recordGlobalWellKnownLock,
+  recordProjectLock,
+  releaseSource,
+  type InstallPlacement,
+  type ResolvedSkills,
+  type TargetInstallResult,
+} from './add.ts';
+import {
+  resolveSkillLocations,
+  type DiscoveredSkillLocation,
+  type SkillLocationResolution,
+  type SkillLocationResolutionOptions,
+} from './skill-relocation.ts';
+import { listInstalledSkills } from './installer.ts';
+import { wellKnownProvider, computeWellKnownSkillDigest } from './providers/index.ts';
 import { removeCommand } from './remove.ts';
 import { sanitizeMetadata } from './sanitize.ts';
 import { track } from './telemetry.ts';
 import { agents, isUniversalAgent } from './agents.ts';
 import type { AgentType } from './types.ts';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 const RESET = '\x1b[0m';
 const BOLD = '\x1b[1m';
 const DIM = '\x1b[38;5;102m';
 const TEXT = '\x1b[38;5;145m';
+
+function printFetching(sourceCount: number): void {
+  if (sourceCount === 0) return;
+  console.log(`${DIM}Fetching ${sourceCount} source${sourceCount === 1 ? '' : 's'}…${RESET}`);
+}
+
+/**
+ * Where a reinstalled skill goes: what `add -y` would pick, with Eve fanned
+ * out over the subagents recorded at install time (`''` is the root agent)
+ * and the install mode the user chose. Agent detection runs once per resolver.
+ */
+function placementResolver(
+  global: boolean
+): (subagents?: string[], installMode?: 'copy') => Promise<InstallPlacement> {
+  let agentsPromise: Promise<AgentType[]> | undefined;
+  return async (subagents, installMode) => {
+    agentsPromise ??= nonInteractiveTargetAgents();
+    let targetAgents = await agentsPromise;
+    const hasSubagents = !!subagents?.length;
+    if (hasSubagents && !targetAgents.includes('eve')) targetAgents = [...targetAgents, 'eve'];
+    const targets = buildInstallTargets(
+      targetAgents,
+      hasSubagents ? subagents.map((s) => (s === '' ? undefined : s)) : [undefined]
+    );
+    return {
+      global,
+      targets,
+      mode: installMode ?? defaultInstallMode(targets),
+      createMissingAgentRoot: (agent) => hasSubagents && agent === 'eve',
+    };
+  };
+}
+
+/** Print per-target failures and the skill's verdict; true when at least one target took it. */
+function reportInstall(
+  name: string,
+  outcome: { ok: boolean; failed: string[]; error?: string }
+): boolean {
+  const safeName = sanitizeMetadata(name);
+  for (const failure of outcome.failed) console.log(`  ${DIM}✗ ${failure}${RESET}`);
+  if (outcome.ok && !outcome.error) {
+    console.log(`  ${TEXT}✓${RESET} Updated ${safeName}`);
+    return true;
+  }
+  console.log(
+    `  ${DIM}✗ Failed to update ${safeName}${outcome.error ? `: ${outcome.error}` : ''}${RESET}`
+  );
+  return false;
+}
+
+/** Skills present on disk in a scope; a locked skill missing here is reinstalled. */
+async function installedSkillNames(global: boolean): Promise<Set<string>> {
+  return new Set((await listInstalledSkills({ global })).map((skill) => skill.name));
+}
+
+function targetOutcome(results: TargetInstallResult[]): { ok: boolean; failed: string[] } {
+  return {
+    ok: results.some((r) => r.success),
+    failed: results.filter((r) => !r.success).map((r) => `${r.agent}: ${r.error}`),
+  };
+}
 
 // ============================================
 // Scope Detection and Prompt
@@ -40,6 +133,17 @@ export interface UpdateCheckOptions {
   yes?: boolean;
   /** Optional skill name(s) to filter on (positional args) */
   skills?: string[];
+  /** Check mode: report each skill that has an update instead of installing it. */
+  reportOutdated?: (name: string) => void;
+}
+
+/**
+ * Public GitHub lock entries use owner/repo shorthand to preserve the exact
+ * skill subpath. Pin that shorthand to github.com so an ambient GH_HOST for a
+ * GitHub Enterprise account cannot redirect an existing public installation.
+ */
+function parseUpdateSource(installUrl: string, sourceType: string) {
+  return parseSource(installUrl, sourceType === 'github' ? { githubHost: 'github.com' } : {});
 }
 
 export function parseUpdateOptions(args: string[]): UpdateCheckOptions {
@@ -238,47 +342,261 @@ export async function getProjectSkillsForUpdate(
   return skills;
 }
 
+export async function promptDeletions(
+  source: string,
+  deletedSkills: string[],
+  isGlobal: boolean,
+  options: UpdateCheckOptions
+): Promise<void> {
+  if (deletedSkills.length === 0) return;
+
+  console.log();
+  console.log(
+    `${DIM}Warning:${RESET} The following skills from ${DIM}${source}${RESET} appear to have been deleted upstream:`
+  );
+  for (const s of deletedSkills) {
+    console.log(`  ${DIM}•${RESET} ${s}`);
+  }
+
+  const isNonInteractive = options.yes || !process.stdin.isTTY;
+
+  if (isNonInteractive) {
+    console.log(`${DIM}Skipping deletion in non-interactive mode.${RESET}`);
+    return;
+  }
+
+  const confirmed = await p.confirm({
+    message: `Would you like to remove the local copies of these deleted skills?`,
+  });
+
+  if (confirmed && !p.isCancel(confirmed)) {
+    for (const s of deletedSkills) {
+      console.log(`${DIM}Removing${RESET} ${s}…`);
+      await removeCommand([s], { yes: true, global: isGlobal });
+    }
+  }
+}
+
 export async function checkAndPromptForDeletions(
   source: string,
   allLockedForSource: string[],
   lockSkills: Record<string, { skillPath?: string }>,
   isGlobal: boolean,
   options: UpdateCheckOptions,
-  discoveredPaths: string[]
-): Promise<string[]> {
-  const deletedSkills = allLockedForSource.filter((name) => {
-    const entry = lockSkills[name];
-    if (!entry?.skillPath) return false;
-    return !discoveredPaths.includes(entry.skillPath);
-  });
+  discovered: DiscoveredSkillLocation[],
+  locationOptions: SkillLocationResolutionOptions = {}
+): Promise<SkillLocationResolution> {
+  const resolution = resolveSkillLocations(
+    allLockedForSource,
+    lockSkills,
+    discovered,
+    locationOptions
+  );
 
-  if (deletedSkills.length > 0) {
+  if (resolution.ambiguousSkills.length > 0) {
     console.log();
     console.log(
-      `${DIM}Warning:${RESET} The following skills from ${DIM}${source}${RESET} appear to have been deleted upstream:`
+      `${DIM}Warning:${RESET} Multiple current paths match these skills from ${DIM}${source}${RESET}; skipping them rather than deleting or migrating the wrong skill:`
     );
-    for (const s of deletedSkills) {
-      console.log(`  ${DIM}•${RESET} ${s}`);
+    for (const name of resolution.ambiguousSkills) {
+      console.log(`  ${DIM}•${RESET} ${sanitizeMetadata(name)}`);
     }
+  }
 
-    const isNonInteractive = options.yes || !process.stdin.isTTY;
+  await promptDeletions(source, resolution.deletedSkills, isGlobal, options);
+  return resolution;
+}
 
-    if (isNonInteractive) {
-      console.log(`${DIM}Skipping deletion in non-interactive mode.${RESET}`);
+export interface WellKnownUpdateItem {
+  name: string;
+  digest: string;
+  subagents?: string[];
+}
+
+export type WellKnownCheckResult =
+  | { status: 'error' }
+  | { status: 'current'; newSkills: string[] }
+  | {
+      status: 'changed';
+      changedSkills: string[];
+      removedSkills: string[];
+      newSkills: string[];
+    };
+
+export async function checkWellKnownForUpdates(
+  baseUrl: string,
+  items: WellKnownUpdateItem[]
+): Promise<WellKnownCheckResult> {
+  let indexResult: Awaited<ReturnType<typeof wellKnownProvider.fetchIndex>>;
+  try {
+    indexResult = await wellKnownProvider.fetchIndex(baseUrl, { updateCheck: true });
+  } catch {
+    return { status: 'error' };
+  }
+  if (!indexResult) return { status: 'error' };
+
+  const byName = new Map(indexResult.entries.map((entry) => [entry.name, entry]));
+  const removedSkills = items.filter((item) => !byName.has(item.name)).map((item) => item.name);
+  const localNames = new Set(items.map((item) => item.name));
+  const newSkills = indexResult.entries
+    .map((entry) => entry.name)
+    .filter((name) => !localNames.has(name));
+  const changedSkills: string[] = [];
+  const needsContentCheck: WellKnownUpdateItem[] = [];
+
+  for (const item of items) {
+    const entry = byName.get(item.name);
+    if (!entry) continue;
+    if (entry.version === '0.2.0') {
+      if (!item.digest || entry.digest !== item.digest) {
+        changedSkills.push(item.name);
+      }
     } else {
-      const confirmed = await p.confirm({
-        message: `Would you like to remove the local copies of these deleted skills?`,
-      });
+      needsContentCheck.push(item);
+    }
+  }
 
-      if (confirmed && !p.isCancel(confirmed)) {
-        for (const s of deletedSkills) {
-          console.log(`${DIM}Removing${RESET} ${s}…`);
-          await removeCommand([s], { yes: true, global: isGlobal });
-        }
+  if (needsContentCheck.length > 0) {
+    const tracked = new Set(needsContentCheck.map((item) => item.name));
+    const skills = (
+      await Promise.all(
+        indexResult.entries
+          .filter((entry) => tracked.has(entry.name))
+          .map((entry) => wellKnownProvider.fetchSkillByEntry(entry).catch(() => null))
+      )
+    ).filter((skill): skill is NonNullable<typeof skill> => skill !== null);
+    if (skills.length === 0) return { status: 'error' };
+    const digests = new Map(
+      skills.map((skill) => [skill.installName, computeWellKnownSkillDigest(skill)])
+    );
+    for (const item of needsContentCheck) {
+      const digest = digests.get(item.name);
+      if (!digest || !item.digest || digest !== item.digest) {
+        changedSkills.push(item.name);
       }
     }
   }
-  return deletedSkills;
+
+  if (changedSkills.length === 0 && removedSkills.length === 0) {
+    return { status: 'current', newSkills };
+  }
+  return { status: 'changed', changedSkills, removedSkills, newSkills };
+}
+
+function printNewSkills(baseUrl: string, newSkills: string[], isGlobal: boolean): void {
+  if (newSkills.length === 0) return;
+  const names = newSkills.map(sanitizeMetadata);
+  console.log(
+    `  ${DIM}${newSkills.length} new skill(s) available from this source:${RESET} ${names.join(', ')}`
+  );
+  console.log(
+    `    ${DIM}To install: ${TEXT}npx skills add ${baseUrl} --skill ${names.join(' ')}${isGlobal ? ' -g' : ''}${RESET}`
+  );
+}
+
+export async function processWellKnownUpdates(
+  groups: Map<string, WellKnownUpdateItem[]>,
+  isGlobal: boolean,
+  options: UpdateCheckOptions
+): Promise<{ successCount: number; failCount: number; changed: boolean }> {
+  let successCount = 0;
+  let failCount = 0;
+  let changed = false;
+
+  const entries = [...groups];
+  printFetching(entries.length);
+  const results = await mapConcurrent(entries, ([baseUrl, items]) =>
+    checkWellKnownForUpdates(baseUrl, items)
+  );
+
+  const pending: Array<{ baseUrl: string; items: WellKnownUpdateItem[]; changedSkills: string[] }> =
+    [];
+  for (const [index, [baseUrl, items]] of entries.entries()) {
+    process.stdout.write(`\r${DIM}Checking skills from source: ${baseUrl}${RESET}\x1b[K\n`);
+
+    const result = results[index]!;
+
+    if (result.status === 'error') {
+      console.log(`  ${DIM}✗ Failed to check skills from ${baseUrl}${RESET}`);
+      continue;
+    }
+
+    if (result.status === 'current') {
+      printNewSkills(baseUrl, result.newSkills, isGlobal);
+      continue;
+    }
+
+    changed = true;
+
+    await promptDeletions(baseUrl, result.removedSkills, isGlobal, options);
+    printNewSkills(baseUrl, result.newSkills, isGlobal);
+
+    if (result.changedSkills.length > 0) {
+      if (options.reportOutdated) {
+        for (const name of result.changedSkills) options.reportOutdated(name);
+      } else {
+        pending.push({ baseUrl, items, changedSkills: result.changedSkills });
+      }
+    }
+  }
+
+  const fetched = await fetchSources(
+    pending.map(({ baseUrl, changedSkills }) => ({
+      parsed: parseSource(baseUrl),
+      skills: changedSkills,
+    }))
+  );
+  const placementFor = placementResolver(isGlobal);
+
+  for (const [index, { baseUrl, items, changedSkills }] of pending.entries()) {
+    const source = fetched[index]!;
+    const itemByName = new Map(items.map((item) => [item.name, item]));
+    // One install per skill: each may record different Eve subagents.
+    for (const name of changedSkills) {
+      console.log(`${TEXT}Updating ${sanitizeMetadata(name)}…${RESET}`);
+      const outcome = await installFetched(source, {
+        skills: [name],
+        placement: await placementFor(isGlobal ? undefined : itemByName.get(name)?.subagents),
+      });
+      if (isGlobal) await recordGlobalWellKnownLock(baseUrl, outcome.installed);
+      else await recordProjectLock(source, outcome.installed);
+      if (reportInstall(name, { ok: outcome.installed.length > 0, ...outcome })) successCount++;
+      else failCount++;
+    }
+    await releaseSource(source);
+  }
+
+  return { successCount, failCount, changed };
+}
+
+/** The network half of a source check; `tempDir` is the caller's to clean up. */
+type SourceCheckout = { tree: RepoTree } | { tempDir: string; note?: string } | { error: true };
+
+/**
+ * GitHub sources are checked through the Trees API unless a locked skill path
+ * no longer exists there (a rename), in which case the repo is cloned to
+ * relocate it. Other sources are always cloned.
+ */
+async function fetchGlobalSource(
+  entry: SkillLockEntry,
+  lockedSkillPaths: Array<string | undefined>
+): Promise<SourceCheckout> {
+  let note: string | undefined;
+  try {
+    if (entry.sourceType === 'github') {
+      const tree = await fetchRepoTree(entry.source, entry.ref, getGitHubToken);
+      if (tree) {
+        const treePaths = new Set(tree.tree.filter((e) => e.type === 'blob').map((e) => e.path));
+        if (lockedSkillPaths.every((path) => !path || treePaths.has(path))) return { tree };
+        note = 'Skill paths changed; resolving via Git clone';
+      } else {
+        note = 'GitHub API unavailable; checking via Git clone';
+      }
+    }
+    return { tempDir: await cloneRepo(entry.sourceUrl || entry.source, entry.ref), note };
+  } catch {
+    return { error: true };
+  }
 }
 
 export async function updateGlobalSkills(
@@ -297,15 +615,28 @@ export async function updateGlobalSkills(
     return { successCount, failCount, checkedCount: 0 };
   }
 
-  const updates: Array<{ name: string; source: string; entry: SkillLockEntry }> = [];
+  const updates: Array<{
+    name: string;
+    entry: SkillLockEntry;
+    /** Upstream hash of the skill folder, recorded once the reinstall succeeds. */
+    skillFolderHash: string;
+  }> = [];
   const skipped: SkippedSkill[] = [];
   const checkable: Array<{ name: string; entry: SkillLockEntry }> = [];
+  const wellKnownGroups = new Map<string, WellKnownUpdateItem[]>();
 
   for (const skillName of skillNames) {
     if (!matchesSkillFilter(skillName, options.skills)) continue;
 
     const entry = lock.skills[skillName];
     if (!entry) continue;
+
+    if (entry.sourceType === 'well-known' && entry.sourceBaseUrl && entry.wellKnownDigest) {
+      const group = wellKnownGroups.get(entry.sourceBaseUrl) || [];
+      group.push({ name: skillName, digest: entry.wellKnownDigest });
+      wellKnownGroups.set(entry.sourceBaseUrl, group);
+      continue;
+    }
 
     if (!entry.skillFolderHash || !entry.skillPath) {
       skipped.push({
@@ -321,96 +652,123 @@ export async function updateGlobalSkills(
     checkable.push({ name: skillName, entry });
   }
 
+  const wellKnownCount = Array.from(wellKnownGroups.values()).reduce(
+    (sum, items) => sum + items.length,
+    0
+  );
+  const {
+    successCount: wkSuccessCount,
+    failCount: wkFailCount,
+    changed: wkChanged,
+  } = await processWellKnownUpdates(wellKnownGroups, true, options);
+  successCount += wkSuccessCount;
+  failCount += wkFailCount;
+
+  // Key by source AND ref: two skills from the same repo pinned to different
+  // refs must each be checked against their own ref's tree. Grouping by source
+  // alone checks the whole group against the first entry's ref, which falsely
+  // reports the other-ref skills as deleted upstream (and then removes them).
   const bySource = new Map<string, typeof checkable>();
   for (const item of checkable) {
-    const source = item.entry.source;
-    const existing = bySource.get(source) || [];
+    const key = `${item.entry.source}\n${item.entry.ref ?? ''}`;
+    const existing = bySource.get(key) || [];
     existing.push(item);
-    bySource.set(source, existing);
+    bySource.set(key, existing);
   }
 
-  for (const [source, itemsForSource] of bySource) {
+  const lockedNamesFor = (first: SkillLockEntry) =>
+    Object.entries(lock.skills)
+      .filter(([_, entry]) => entry.source === first.source && entry.ref === first.ref)
+      .map(([name, _]) => name);
+
+  const onDisk = await installedSkillNames(true);
+  const groups = [...bySource.values()];
+  printFetching(groups.length);
+  const checkouts = await mapConcurrent(groups, (itemsForSource) => {
     const firstEntry = itemsForSource[0]!.entry;
-    const sourceUrl = firstEntry.sourceUrl || firstEntry.source;
-    let tempDir: string | null = null;
+    return fetchGlobalSource(
+      firstEntry,
+      lockedNamesFor(firstEntry).map((name) => lock.skills[name]?.skillPath)
+    );
+  });
+
+  for (const [index, itemsForSource] of groups.entries()) {
+    const firstEntry = itemsForSource[0]!.entry;
+    const source = firstEntry.source;
+    const isGitHubSource = firstEntry.sourceType === 'github';
+    const checkout = checkouts[index]!;
 
     process.stdout.write(`\r${DIM}Checking skills from source: ${source}${RESET}\x1b[K\n`);
 
-    try {
-      const isGitHubSource = firstEntry.sourceType === 'github';
+    if ('error' in checkout) {
+      console.log(`  ${DIM}✗ Failed to check skills from ${source}${RESET}`);
+      continue;
+    }
 
-      if (isGitHubSource) {
-        const tree = await fetchRepoTree(source, firstEntry.ref, getGitHubToken);
-
-        if (!tree) {
-          console.log(`  ${DIM}✗ Failed to fetch tree for ${source}${RESET}`);
-          continue;
+    if ('tree' in checkout) {
+      for (const { name: skillName, entry } of itemsForSource) {
+        const latestHash = getSkillFolderHashFromTree(checkout.tree, entry.skillPath!);
+        if (latestHash && (latestHash !== entry.skillFolderHash || !onDisk.has(skillName))) {
+          updates.push({ name: skillName, entry, skillFolderHash: latestHash });
         }
-
-        const discoveredPaths = findSkillMdPaths(tree);
-
-        const allLockedForSource = Object.entries(lock.skills)
-          .filter(([_, entry]) => entry.source === source)
-          .map(([name, _]) => name);
-
-        const deletedSkills = await checkAndPromptForDeletions(
-          source,
-          allLockedForSource,
-          lock.skills,
-          true,
-          options,
-          discoveredPaths
-        );
-
-        const deletedSkillSet = new Set(deletedSkills);
-
-        for (const { name: skillName, entry } of itemsForSource) {
-          if (deletedSkillSet.has(skillName)) continue;
-
-          const latestHash = getSkillFolderHashFromTree(tree, entry.skillPath!);
-          if (latestHash && latestHash !== entry.skillFolderHash) {
-            updates.push({ name: skillName, source, entry });
-          }
-        }
-
-        continue;
       }
+      continue;
+    }
 
-      tempDir = await cloneRepo(sourceUrl, firstEntry.ref);
-      const discoveredPaths = (await discoverSkills(tempDir)).map((skill) => {
-        return join(relative(tempDir!, skill.path), 'SKILL.md').split(sep).join('/');
+    const { tempDir, note } = checkout;
+    if (note) console.log(`  ${DIM}${note}${RESET}`);
+
+    try {
+      const discovered = await discoverSkills(tempDir, undefined, {
+        fullDepth: true,
+        includeDuplicateNames: true,
       });
+      const discoveredLocations = discovered.map((skill) => ({
+        name: skill.name,
+        skillPath: join(relative(tempDir, skill.path), 'SKILL.md').split(sep).join('/'),
+      }));
 
-      const allLockedForSource = Object.entries(lock.skills)
-        .filter(([_, entry]) => entry.source === source)
-        .map(([name, _]) => name);
-
-      const deletedSkills = await checkAndPromptForDeletions(
+      const resolution = await checkAndPromptForDeletions(
         source,
-        allLockedForSource,
+        lockedNamesFor(firstEntry),
         lock.skills,
         true,
         options,
-        discoveredPaths
+        discoveredLocations,
+        // Path-addressable sources reinstall only the locked directory, so a
+        // same-name mirror elsewhere in the repo is not ambiguous. Generic Git
+        // sources reinstall from the whole repo and remain fail-closed.
+        { exactPathDisambiguates: !shouldUseFullDepthForUpdate(firstEntry) }
       );
 
-      const deletedSkillSet = new Set(deletedSkills);
+      const deletedSkillSet = new Set(resolution.deletedSkills);
 
       for (const { name: skillName, entry } of itemsForSource) {
         if (deletedSkillSet.has(skillName)) continue;
 
-        const skillPath = entry.skillPath!;
-        if (!discoveredPaths.includes(skillPath)) continue;
+        const skillPath = resolution.resolvedPaths.get(skillName);
+        if (!skillPath) continue;
 
-        const latestHash = await computeSkillFolderHash(join(tempDir, dirname(skillPath)));
-        if (latestHash && latestHash !== entry.skillFolderHash) {
-          updates.push({ name: skillName, source, entry });
+        const usesGitTreeHash = isGitHubSource && /^[0-9a-f]{40}$/i.test(entry.skillFolderHash);
+        const latestHash = usesGitTreeHash
+          ? await getGitTreeHash(tempDir, skillPath)
+          : await computeSkillFolderHash(join(tempDir, dirname(skillPath)));
+        const relocated = skillPath !== entry.skillPath;
+        if (
+          relocated ||
+          (latestHash && (latestHash !== entry.skillFolderHash || !onDisk.has(skillName)))
+        ) {
+          updates.push({
+            name: skillName,
+            entry: { ...entry, skillPath },
+            skillFolderHash: latestHash ?? '',
+          });
         }
       }
     } catch (error) {
       console.log(`  ${DIM}✗ Failed to check skills from ${source}${RESET}`);
     } finally {
-      if (tempDir) await cleanupTempDir(tempDir);
+      await cleanupTempDir(tempDir);
     }
   }
 
@@ -418,13 +776,20 @@ export async function updateGlobalSkills(
     process.stdout.write('\r\x1b[K');
   }
 
-  const checkedCount = checkable.length + skipped.length;
+  const checkedCount = checkable.length + skipped.length + wellKnownCount;
 
-  if (checkable.length === 0 && skipped.length === 0) {
+  if (checkable.length === 0 && skipped.length === 0 && wellKnownCount === 0) {
     if (!options.skills) {
       console.log(`${DIM}No global skills to check.${RESET}`);
     }
     return { successCount, failCount, checkedCount: 0 };
+  }
+
+  if (checkable.length === 0 && skipped.length === 0) {
+    if (!wkChanged) {
+      console.log(`${TEXT}✓ All global skills are up to date${RESET}`);
+    }
+    return { successCount, failCount, checkedCount };
   }
 
   if (checkable.length === 0 && skipped.length > 0) {
@@ -433,51 +798,54 @@ export async function updateGlobalSkills(
   }
 
   if (updates.length === 0) {
-    console.log(`${TEXT}✓ All global skills are up to date${RESET}`);
+    if (!wkChanged) {
+      console.log(`${TEXT}✓ All global skills are up to date${RESET}`);
+    }
+    return { successCount, failCount, checkedCount };
+  }
+
+  if (options.reportOutdated) {
+    for (const { name } of updates) options.reportOutdated(name);
+    printSkippedSkills(skipped);
     return { successCount, failCount, checkedCount };
   }
 
   console.log(`${TEXT}Found ${updates.length} global update(s)${RESET}`);
   console.log();
 
-  for (const update of updates) {
-    const safeName = sanitizeMetadata(update.name);
-    console.log(`${TEXT}Updating ${safeName}…${RESET}`);
+  // Each update is fetched on its own (its skill folder as the subpath), as
+  // `add` would, so eligible GitHub repos take the blob fast path.
+  const installable = updates.flatMap((update) => {
     const installUrl = buildUpdateInstallSource(update.entry);
-    if (!installUrl) {
-      failCount++;
-      console.log(
-        `  ${DIM}✗ Cannot update ${safeName}: lock file is missing sourceUrl for this generic Git source${RESET}`
-      );
-      continue;
-    }
+    if (installUrl) return [{ ...update, installUrl }];
+    failCount++;
+    console.log(
+      `  ${DIM}✗ Cannot update ${sanitizeMetadata(update.name)}: lock file is missing sourceUrl for this generic Git source${RESET}`
+    );
+    return [];
+  });
+  const fetched = await fetchSources(
+    installable.map(({ entry, name, installUrl }) => ({
+      parsed: parseUpdateSource(installUrl, entry.sourceType),
+      skills: [name],
+      fullDepth: shouldUseFullDepthForUpdate(entry),
+    }))
+  );
+  const placementFor = placementResolver(true);
 
-    const cliEntry = join(__dirname, '..', 'bin', 'cli.mjs');
-    if (!existsSync(cliEntry)) {
-      failCount++;
-      console.log(
-        `  ${DIM}✗ Failed to update ${safeName}: CLI entrypoint not found at ${cliEntry}${RESET}`
-      );
-      continue;
-    }
-    const result = spawnSync(process.execPath, [cliEntry, 'add', installUrl, '-g', '-y'], {
-      stdio: ['inherit', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-      // Never spawn through a shell. process.execPath is an absolute path to the
-      // node binary, so no shell is needed to resolve it. installUrl is derived
-      // from the lock file (and ref is URL-decoded, so influenceable by whoever
-      // publishes a skill); a shell on Windows would let metacharacters in that
-      // value inject commands. Passing argv directly keeps it inert.
-      shell: false,
+  for (const [index, { name, entry, skillFolderHash }] of installable.entries()) {
+    console.log(`${TEXT}Updating ${sanitizeMetadata(name)}…${RESET}`);
+    const source = fetched[index]!;
+    const outcome = await installFetched(source, {
+      skills: [name],
+      placement: await placementFor(undefined, entry.installMode),
     });
-
-    if (result.status === 0) {
-      successCount++;
-      console.log(`  ${TEXT}✓${RESET} Updated ${safeName}`);
-    } else {
-      failCount++;
-      console.log(`  ${DIM}✗ Failed to update ${safeName}${RESET}`);
+    await releaseSource(source);
+    if (outcome.installed.length > 0) {
+      await addSkillToLock(name, { ...entry, skillFolderHash });
     }
+    if (reportInstall(name, { ok: outcome.installed.length > 0, ...outcome })) successCount++;
+    else failCount++;
   }
 
   printSkippedSkills(skipped);
@@ -501,10 +869,31 @@ export async function updateProjectSkills(
     return { successCount, failCount, foundCount: 0 };
   }
 
-  const updatable = projectSkills.filter((s) => s.entry.skillPath);
-  const legacy = projectSkills.filter((s) => !s.entry.skillPath);
+  const wellKnownGroups = new Map<string, WellKnownUpdateItem[]>();
+  const nonWellKnown: typeof projectSkills = [];
+  for (const skill of projectSkills) {
+    const { entry } = skill;
+    if (entry.sourceType === 'well-known' && entry.sourceUrl && entry.wellKnownDigest) {
+      const group = wellKnownGroups.get(entry.sourceUrl) || [];
+      group.push({
+        name: skill.name,
+        digest: entry.wellKnownDigest,
+        subagents: entry.subagents,
+      });
+      wellKnownGroups.set(entry.sourceUrl, group);
+    } else {
+      nonWellKnown.push(skill);
+    }
+  }
+  const wellKnownCount = Array.from(wellKnownGroups.values()).reduce(
+    (sum, items) => sum + items.length,
+    0
+  );
 
-  if (updatable.length === 0) {
+  const updatable = nonWellKnown.filter((s) => s.entry.skillPath);
+  const legacy = nonWellKnown.filter((s) => !s.entry.skillPath);
+
+  if (updatable.length === 0 && wellKnownCount === 0) {
     console.log(`${DIM}No project skills can be updated in place.${RESET}`);
     printLegacyProjectSkills(legacy);
     return { successCount, failCount, foundCount: projectSkills.length };
@@ -535,38 +924,57 @@ export async function updateProjectSkills(
     console.log(`${TEXT}Updating for: ${targetParts.join(', ')}${RESET}`);
   }
 
-  console.log(`${TEXT}Refreshing ${updatable.length} skill(s)…${RESET}`);
+  console.log(`${TEXT}Checking ${updatable.length + wellKnownCount} skill(s)…${RESET}`);
   console.log();
 
+  const { successCount: wkSuccessCount, failCount: wkFailCount } = await processWellKnownUpdates(
+    wellKnownGroups,
+    false,
+    options
+  );
+  successCount += wkSuccessCount;
+  failCount += wkFailCount;
+
+  // Key by source AND ref (see updateGlobalSkills) so skills from one repo
+  // pinned to different refs are each checked against their own ref's tree.
   const bySource = new Map<string, typeof updatable>();
   for (const skill of updatable) {
     const source = skill.entry.sourceUrl || skill.entry.source;
-    const existing = bySource.get(source) || [];
+    const key = `${source}\n${skill.entry.ref ?? ''}`;
+    const existing = bySource.get(key) || [];
     existing.push(skill);
-    bySource.set(source, existing);
+    bySource.set(key, existing);
   }
 
   const localLock = await readLocalLock();
-  const cliEntry = join(__dirname, '..', 'bin', 'cli.mjs');
+  const onDisk = await installedSkillNames(false);
+  const placementFor = placementResolver(false);
+  let upToDateCount = 0;
 
-  if (!existsSync(cliEntry)) {
-    console.log(`${DIM}✗ CLI entrypoint not found at ${cliEntry}${RESET}`);
-    return { successCount, failCount: updatable.length, foundCount: projectSkills.length };
-  }
+  const groups = [...bySource.values()].map((skillsForSource) => ({
+    skillsForSource,
+    cloneSource: buildLocalCloneSource(skillsForSource[0]!.entry),
+  }));
+  printFetching(groups.filter((group) => group.cloneSource !== null).length);
+  // Clone dir per group; null when the source is unresolvable or the clone failed.
+  const clones = await mapConcurrent(groups, ({ skillsForSource, cloneSource }) =>
+    cloneSource === null
+      ? Promise.resolve(null)
+      : cloneRepo(cloneSource, skillsForSource[0]!.entry.ref).catch(() => null)
+  );
 
-  for (const [source, skillsForSource] of bySource) {
+  for (const [index, { skillsForSource, cloneSource }] of groups.entries()) {
     const firstEntry = skillsForSource[0]!.entry;
-    const sourceUrl = firstEntry.sourceUrl || firstEntry.source;
+    const source = firstEntry.sourceUrl || firstEntry.source;
     const ref = firstEntry.ref;
 
     const allLockedForSource = Object.entries(localLock.skills)
-      .filter(([_, entry]) => (entry.sourceUrl || entry.source) === source)
+      .filter(([_, entry]) => (entry.sourceUrl || entry.source) === source && entry.ref === ref)
       .map(([name, _]) => name);
 
-    let tempDir: string | null = null;
-    let deletedSkills: string[] = [];
+    const tempDir = clones[index]!;
 
-    if (buildLocalUpdateSource(firstEntry) === null) {
+    if (cloneSource === null) {
       failCount += skillsForSource.length;
       console.log(
         `${DIM}✗ Cannot update ${source}: skills-lock.json is missing sourceUrl for this generic Git source${RESET}`
@@ -574,72 +982,86 @@ export async function updateProjectSkills(
       continue;
     }
 
-    try {
-      tempDir = await cloneRepo(sourceUrl, ref);
-      const discovered = await discoverSkills(tempDir);
+    if (tempDir === null) {
+      failCount += skillsForSource.length;
+      console.log(`${DIM}✗ Failed to check for deleted skills from ${source}${RESET}`);
+      continue;
+    }
 
-      const discoveredPaths = discovered.map((s) => {
-        const relPath = relative(tempDir!, s.path);
-        return join(relPath, 'SKILL.md').split(sep).join('/');
+    let checked = false;
+    try {
+      const discovered = await discoverSkills(tempDir, undefined, {
+        fullDepth: true,
+        includeDuplicateNames: true,
       });
 
-      deletedSkills = await checkAndPromptForDeletions(
+      const discoveredLocations = discovered.map((skill) => ({
+        name: skill.name,
+        skillPath: join(relative(tempDir, skill.path), 'SKILL.md').split(sep).join('/'),
+      }));
+
+      const resolution = await checkAndPromptForDeletions(
         source,
         allLockedForSource,
         localLock.skills,
         false,
         options,
-        discoveredPaths
+        discoveredLocations,
+        { exactPathDisambiguates: !shouldUseFullDepthForUpdate(firstEntry) }
       );
-    } catch (error) {
-      console.log(`${DIM}✗ Failed to check for deleted skills from ${source}${RESET}`);
-    } finally {
-      if (tempDir) {
-        await cleanupTempDir(tempDir);
-      }
-    }
+      checked = true;
+      const deleted = new Set(resolution.deletedSkills);
+      const skillAt = new Map(discovered.map((s, i) => [discoveredLocations[i]!.skillPath, s]));
+      const resolved: ResolvedSkills = { skills: discovered, tempDir, blobResult: null };
 
-    const remainingSkills = skillsForSource.filter((s) => !deletedSkills.includes(s.name));
+      for (const skill of skillsForSource) {
+        if (deleted.has(skill.name)) continue;
+        const skillPath = resolution.resolvedPaths.get(skill.name);
+        const current = skillPath && skillAt.get(skillPath);
+        if (!skillPath || !current) continue;
 
-    for (const skill of remainingSkills) {
-      const safeName = sanitizeMetadata(skill.name);
-      console.log(`${TEXT}Updating ${safeName}…${RESET}`);
-      const installUrl = buildLocalUpdateSource(skill.entry);
-      if (!installUrl) {
-        failCount++;
-        console.log(
-          `  ${DIM}✗ Cannot update ${safeName}: skills-lock.json is missing sourceUrl for this generic Git source${RESET}`
-        );
-        continue;
-      }
-
-      // Preserve Eve subagent placement recorded at install time. The lock stores
-      // '' for the root agent, which maps to the `root` keyword for `add --subagent`.
-      const subagentArgs = skill.entry.subagents?.length
-        ? ['--subagent', ...skill.entry.subagents.map((s) => (s === '' ? 'root' : s))]
-        : [];
-
-      const result = spawnSync(
-        process.execPath,
-        [cliEntry, 'add', installUrl, '--skill', skill.name, ...subagentArgs, '-y'],
-        {
-          stdio: ['inherit', 'pipe', 'pipe'],
-          encoding: 'utf-8',
-          // Never spawn through a shell — same reasoning as updateGlobalSkills:
-          // execPath is absolute (no shell resolution needed) and installUrl/ref
-          // come from the lock file, so a shell would allow command injection on
-          // Windows. Pass argv directly instead.
-          shell: false,
+        // Hash the clone the same way `add` records computedHash, so an
+        // unchanged skill is not reinstalled.
+        const computedHash = await computeSkillFolderHash(current.path).catch(() => null);
+        if (
+          skillPath === skill.entry.skillPath &&
+          computedHash === skill.entry.computedHash &&
+          onDisk.has(skill.name)
+        ) {
+          upToDateCount++;
+          continue;
         }
-      );
+        if (options.reportOutdated) {
+          options.reportOutdated(skill.name);
+          continue;
+        }
 
-      if (result.status === 0) {
-        successCount++;
-        console.log(`  ${TEXT}✓${RESET} Updated ${safeName}`);
-      } else {
-        failCount++;
-        console.log(`  ${DIM}✗ Failed to update ${safeName}${RESET}`);
+        console.log(`${TEXT}Updating ${sanitizeMetadata(skill.name)}…${RESET}`);
+        const results = await installToTargets(
+          resolved,
+          [current],
+          await placementFor(skill.entry.subagents, skill.entry.installMode)
+        );
+        const outcome = targetOutcome(results);
+        if (outcome.ok && computedHash) {
+          await addSkillToLocalLock(skill.name, { ...skill.entry, skillPath, computedHash });
+        }
+        if (reportInstall(skill.name, outcome)) successCount++;
+        else failCount++;
       }
+    } catch {
+      console.log(`${DIM}✗ Failed to check for deleted skills from ${source}${RESET}`);
+      if (!checked) failCount += skillsForSource.length;
+    } finally {
+      await cleanupTempDir(tempDir);
+    }
+  }
+
+  if (upToDateCount > 0) {
+    if (upToDateCount === updatable.length && wkSuccessCount === 0 && wkFailCount === 0) {
+      console.log(`${TEXT}✓ All project skills are up to date${RESET}`);
+    } else {
+      console.log(`${DIM}${upToDateCount} project skill(s) already up to date${RESET}`);
     }
   }
 
@@ -668,11 +1090,23 @@ export function printLegacyProjectSkills(
   }
 }
 
-export async function runUpdate(args: string[] = []): Promise<void> {
+export async function runUpdate(
+  args: string[] = [],
+  mode: 'update' | 'check' = 'update'
+): Promise<void> {
   const options = parseUpdateOptions(args);
+  let outdatedCount = 0;
+  if (mode === 'check') {
+    // Never prompt: pick the scope automatically and only report upstream deletions.
+    options.yes = true;
+    options.reportOutdated = (name) => {
+      outdatedCount++;
+      console.log(`${TEXT}↑ ${sanitizeMetadata(name)} has an update${RESET}`);
+    };
+  }
   const scope = await resolveUpdateScope(options);
 
-  if (options.skills) {
+  if (options.skills && mode === 'update') {
     console.log(`${TEXT}Updating ${options.skills.join(', ')}…${RESET}`);
   } else {
     console.log(`${TEXT}Checking for skill updates…${RESET}`);
@@ -716,6 +1150,12 @@ export async function runUpdate(args: string[] = []): Promise<void> {
   }
   if (totalFail > 0) {
     console.log(`${DIM}Failed to update ${totalFail} skill(s)${RESET}`);
+    process.exitCode = 1;
+  }
+  if (outdatedCount > 0) {
+    console.log(
+      `${TEXT}${outdatedCount} skill(s) can be updated; run ${BOLD}npx skills update${RESET}${TEXT} to install${RESET}`
+    );
     process.exitCode = 1;
   }
 

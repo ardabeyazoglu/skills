@@ -12,10 +12,16 @@ vi.mock('../src/sync.ts', () => ({
 vi.mock('../src/agents.ts', () => ({
   getUniversalAgents: vi.fn().mockReturnValue(['cursor']),
 }));
+// The suite itself runs in CI, where --frozen-lockfile would otherwise default on
+vi.mock('../src/ci.ts', () => ({ isCI: () => false }));
 
 describe('runInstallFromLock', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(add.fetchSources).mockImplementation(async (requests) =>
+      requests.map(({ parsed }) => ({ parsed, resolved: null, error: 'not fetched' }))
+    );
+    vi.mocked(add.installFromSource).mockResolvedValue({ installed: ['skill-a'], failed: [] });
   });
 
   it('restores self-hosted GitLab project locks from sourceUrl', async () => {
@@ -34,13 +40,11 @@ describe('runInstallFromLock', () => {
 
     await runInstallFromLock([]);
 
-    expect(add.runAdd).toHaveBeenCalledWith(
-      ['https://gitlab.example.com/acme/skills.git'],
+    expect(add.installFromSource).toHaveBeenCalledWith(
       expect.objectContaining({
-        skill: ['skill-a'],
-        agent: ['cursor'],
-        yes: true,
-      })
+        parsed: expect.objectContaining({ url: 'https://gitlab.example.com/acme/skills.git' }),
+      }),
+      { skills: ['skill-a'], agents: ['cursor'] }
     );
   });
 
@@ -59,6 +63,6 @@ describe('runInstallFromLock', () => {
 
     await runInstallFromLock([]);
 
-    expect(add.runAdd).not.toHaveBeenCalled();
+    expect(add.installFromSource).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,7 @@
-const TELEMETRY_URL = 'https://add-skill.vercel.sh/t';
-const AUDIT_URL = 'https://add-skill.vercel.sh/audit';
+import { isCI } from './ci.ts';
+
+const TELEMETRY_URL = 'https://www.skills.sh/tele/t';
+const AUDIT_URL = 'https://www.skills.sh/tele/audit';
 
 interface InstallTelemetryData {
   event: 'install';
@@ -8,6 +10,8 @@ interface InstallTelemetryData {
   agents: string;
   global?: '1';
   skillFiles?: string; // JSON stringified { skillName: relativePath }
+  /** User-facing URL that can be passed back to `skills add`. */
+  installUrl?: string;
   /** Caller-provided JSON attached to this install telemetry event. */
   metadata?: string;
   /**
@@ -68,19 +72,6 @@ export function setDetectedAgent(agentName: string | null): void {
   detectedAgentName = agentName;
 }
 
-function isCI(): boolean {
-  return !!(
-    process.env.CI ||
-    process.env.GITHUB_ACTIONS ||
-    process.env.GITLAB_CI ||
-    process.env.CIRCLECI ||
-    process.env.TRAVIS ||
-    process.env.BUILDKITE ||
-    process.env.JENKINS_URL ||
-    process.env.TEAMCITY_VERSION
-  );
-}
-
 function isEnabled(): boolean {
   return !process.env.DISABLE_TELEMETRY && !process.env.DO_NOT_TRACK;
 }
@@ -110,6 +101,7 @@ export async function fetchAuditData(
   skillSlugs: string[],
   timeoutMs = 3000
 ): Promise<AuditResponse | null> {
+  if (!isEnabled()) return null;
   if (skillSlugs.length === 0) return null;
 
   try {
